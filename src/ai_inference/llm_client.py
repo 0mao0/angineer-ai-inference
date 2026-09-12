@@ -131,6 +131,44 @@ def _build_timeout(timeout_config: TimeoutConfig) -> httpx.Timeout:
     )
 
 
+# 系统代理绕过：httpx 默认 trust_env=True 会读 Windows 注册表系统代理，
+# 本机开过代理后，对内网穿透隧道域名（如 judge 的 dgx-*.cccc-sdc.com）会 CONNECT 进代理
+# 导致 TLS 握手断流（SSL: UNEXPECTED_EOF_WHILE_READING），表现为 "Provider 不可用: Connection error."。
+# 所有端点（angineer.cn 网关 / 隧道直连）都应公网直连，故默认绕过系统代理；
+# 确需走系统代理的环境设 LLM_HTTP_TRUST_ENV=1 恢复 httpx 默认行为。
+_TRUST_ENV = os.getenv("LLM_HTTP_TRUST_ENV", "0") == "1"
+
+
+def _new_httpx_client(timeout: httpx.Timeout) -> httpx.Client:
+    return httpx.Client(timeout=timeout, trust_env=_TRUST_ENV)
+
+
+def _new_async_httpx_client(timeout: httpx.Timeout) -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=timeout, trust_env=_TRUST_ENV)
+
+
+def _build_extra_body(config: LLMModelConfig) -> Dict[str, Any]:
+    """extra_body 统一构建（原为 4 处复制粘贴，收敛至此）。
+
+    优先级：端点级显式 enable_thinking > 环境变量 ANGINEER_CHAT_TEMPLATE_KWARGS >
+    隐式 URL/模型名规则。端点级开关的意义：隐式规则只认 dashscope/angineer.cn/qwen3.6，
+    直连 vLLM/DGX 的思考模型一条都不命中——思考全量输出曾是 53 题全灭事故的触发面，
+    现在这类端点应在 LLM_CONFIGS 里显式声明 "enable_thinking": true/false（如
+    dgx-qwen38-flash 直连提速可显式 false），而不是依赖不被命中的隐式规则。"""
+    extra_body: Dict[str, Any] = {}
+    if getattr(config, "enable_thinking", None) is not None:
+        extra_body["chat_template_kwargs"] = {"enable_thinking": bool(config.enable_thinking)}
+        return extra_body
+    _template_kwargs = json.loads(os.getenv("ANGINEER_CHAT_TEMPLATE_KWARGS", "null"))
+    if _template_kwargs:
+        extra_body["chat_template_kwargs"] = _template_kwargs
+    elif "dashscope" in config.base_url or "aliyun" in config.base_url:
+        extra_body["enable_thinking"] = False
+    elif "angineer.cn" in config.base_url or "qwen3.6" in (config.model or ""):
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    return extra_body
+
+
 def _raise_mapped(error: Optional[Exception]) -> None:
     """把 OpenAI SDK 异常映射为 ai-inference 错误层级并抛出。"""
     if error is None:
@@ -505,17 +543,11 @@ class LLMClient:
         client = OpenAI(
             api_key=config.api_key,
             base_url=base_url,
-            timeout=_build_timeout(timeout_config)
+            timeout=_build_timeout(timeout_config),
+            http_client=_new_httpx_client(_build_timeout(timeout_config)),
         )
 
-        extra_body = {}
-        _template_kwargs = json.loads(os.getenv("ANGINEER_CHAT_TEMPLATE_KWARGS", "null"))
-        if _template_kwargs:
-            extra_body["chat_template_kwargs"] = _template_kwargs
-        elif "dashscope" in config.base_url or "aliyun" in config.base_url:
-            extra_body["enable_thinking"] = False
-        elif "124.221.238.70" in config.base_url or "qwen3.6" in config.model:
-            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        extra_body = _build_extra_body(config)
 
         effective_max_tokens = max_tokens if max_tokens is not None else self._config.max_tokens
         response = client.chat.completions.create(
@@ -562,17 +594,11 @@ class LLMClient:
         client = AsyncOpenAI(
             api_key=config.api_key,
             base_url=base_url,
-            timeout=_build_timeout(timeout_config)
+            timeout=_build_timeout(timeout_config),
+            http_client=_new_async_httpx_client(_build_timeout(timeout_config)),
         )
 
-        extra_body = {}
-        _template_kwargs = json.loads(os.getenv("ANGINEER_CHAT_TEMPLATE_KWARGS", "null"))
-        if _template_kwargs:
-            extra_body["chat_template_kwargs"] = _template_kwargs
-        elif "dashscope" in config.base_url or "aliyun" in config.base_url:
-            extra_body["enable_thinking"] = False
-        elif "124.221.238.70" in config.base_url or "qwen3.6" in config.model:
-            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        extra_body = _build_extra_body(config)
 
         effective_max_tokens = max_tokens if max_tokens is not None else self._config.max_tokens
         response = await client.chat.completions.create(
@@ -619,17 +645,11 @@ class LLMClient:
         client = OpenAI(
             api_key=config.api_key,
             base_url=base_url,
-            timeout=_build_timeout(timeout_config)
+            timeout=_build_timeout(timeout_config),
+            http_client=_new_httpx_client(_build_timeout(timeout_config)),
         )
 
-        extra_body = {}
-        _template_kwargs = json.loads(os.getenv("ANGINEER_CHAT_TEMPLATE_KWARGS", "null"))
-        if _template_kwargs:
-            extra_body["chat_template_kwargs"] = _template_kwargs
-        elif "dashscope" in config.base_url or "aliyun" in config.base_url:
-            extra_body["enable_thinking"] = False
-        elif "124.221.238.70" in config.base_url or "qwen3.6" in config.model:
-            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        extra_body = _build_extra_body(config)
 
         effective_max_tokens = max_tokens if max_tokens is not None else self._config.max_tokens
         response = client.chat.completions.create(
@@ -654,7 +674,10 @@ class LLMClient:
                     yield {"type": "delta", "text": content}
                 reasoning = getattr(delta, "reasoning", None)
                 if reasoning:
-                    yield {"type": "delta", "reasoning": reasoning}
+                    # delta 事件必须恒带 text（思考增量给空串）：消费方一律按 event["text"] 取值，
+                    # 缺键会让整次生成以 KeyError('text') 失败（2026-09-06 评测 53 题全灭实踩：
+                    # Qwen3.8-Flash 直连端点思考全量输出时必现）
+                    yield {"type": "delta", "text": "", "reasoning": reasoning}
                 if getattr(choice, "finish_reason", None):
                     finish_reason = choice.finish_reason
             chunk_usage = getattr(chunk, "usage", None)
@@ -680,17 +703,11 @@ class LLMClient:
         client = AsyncOpenAI(
             api_key=config.api_key,
             base_url=base_url,
-            timeout=_build_timeout(timeout_config)
+            timeout=_build_timeout(timeout_config),
+            http_client=_new_async_httpx_client(_build_timeout(timeout_config)),
         )
 
-        extra_body = {}
-        _template_kwargs = json.loads(os.getenv("ANGINEER_CHAT_TEMPLATE_KWARGS", "null"))
-        if _template_kwargs:
-            extra_body["chat_template_kwargs"] = _template_kwargs
-        elif "dashscope" in config.base_url or "aliyun" in config.base_url:
-            extra_body["enable_thinking"] = False
-        elif "124.221.238.70" in config.base_url or "qwen3.6" in config.model:
-            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        extra_body = _build_extra_body(config)
 
         effective_max_tokens = max_tokens if max_tokens is not None else self._config.max_tokens
         response = await client.chat.completions.create(
@@ -715,7 +732,10 @@ class LLMClient:
                     yield {"type": "delta", "text": content}
                 reasoning = getattr(delta, "reasoning", None)
                 if reasoning:
-                    yield {"type": "delta", "reasoning": reasoning}
+                    # delta 事件必须恒带 text（思考增量给空串）：消费方一律按 event["text"] 取值，
+                    # 缺键会让整次生成以 KeyError('text') 失败（2026-09-06 评测 53 题全灭实踩：
+                    # Qwen3.8-Flash 直连端点思考全量输出时必现）
+                    yield {"type": "delta", "text": "", "reasoning": reasoning}
                 if getattr(choice, "finish_reason", None):
                     finish_reason = choice.finish_reason
             chunk_usage = getattr(chunk, "usage", None)
@@ -852,7 +872,7 @@ class LLMClient:
             tools=tools,
         ):
             if event["type"] == "delta":
-                yield event["text"]
+                yield event.get("text", "")
             elif event["type"] == "stream_failed":
                 raise LLMStreamError(
                     f"流式输出中途失败: {event['error']['message']}",
@@ -923,7 +943,7 @@ class LLMClient:
                 ):
                     if event["type"] == "delta":
                         started = True
-                        partial_parts.append(event["text"])
+                        partial_parts.append(event.get("text", ""))
                         yield event
                         continue
 
@@ -1117,7 +1137,7 @@ class LLMClient:
             tools=tools,
         ):
             if event["type"] == "delta":
-                yield event["text"]
+                yield event.get("text", "")
             elif event["type"] == "stream_failed":
                 raise LLMStreamError(
                     f"流式输出中途失败: {event['error']['message']}",
@@ -1181,7 +1201,7 @@ class LLMClient:
                 ):
                     if event["type"] == "delta":
                         started = True
-                        partial_parts.append(event["text"])
+                        partial_parts.append(event.get("text", ""))
                         yield event
                         continue
 
