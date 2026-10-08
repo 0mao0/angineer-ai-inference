@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3
+
+- feat: `LLM_CONFIGS` 端点级 `extra_body` 全量接管——端点声明 `extra_body` 即原样返回，作为 `reasoning_effort` 等档位参数的唯一入口。注意：思考开关有两套互斥机制（`chat_template_kwargs` vs `reasoning_effort`），叠加发送时服务端合并行为不可控，故 `extra_body` 与 `enable_thinking` 不得混用
+- feat: 上下文超限 400 最后防线——按报错解析 `maximum context length` 与 input tokens，把 `max_tokens` 钳制为 `limit − input − 512` 后单次重试（同步/异步两条链路各自记账，只重试一次），仍失败走原报错；解析不出的 400 保留原报错通道（不改写、不吞）。本层只降输出预算，输入压减由消费方负责（主仓库侧「证据上桌 + 上下文软帽」的第 3 层）
+
 ## 0.2.2
 
 - fix: `LLM_CONFIGS` 端点级 `enable_thinking` 声明此前被静默丢弃——0.2.1 引入了字段与客户端处理，但 `load_llm_models_from_env()` 构造 `LLMModelConfig` 时漏传该字段，Pydantic 取默认 `None`，于是「端点级显式 > `ANGINEER_CHAT_TEMPLATE_KWARGS` > 隐式 URL/模型名规则」里最高优先级整层失效（直连 vLLM/DGX 端点三层全不命中、发不出任何思考控制）。loader 现补传该字段，并新增宽松布尔解析：`true/false` 与 `"true"/"false"/"1"/"0"/"yes"/"no"/"on"/"off"` 都认，识别不了按默认值处理并打 WARNING（不把原值直接透传给 pydantic，避免 `.env` 写成字符串或拼错时在加载期抛异常把调用方进程打挂）
